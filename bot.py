@@ -284,7 +284,8 @@ async def cb_pay_stars(cb: CallbackQuery, bot: Bot):
 @router.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery, bot: Bot):
     await bot.answer_pre_checkout_query(query.id, ok=True)
-@router.message(F.text & ~F.text.startswith("/"))
+    
+@router.message(F.successful_payment)
 async def payment_success(msg: Message):
     until = activate_subscription(msg.from_user.id, SUBSCRIPTION_DAYS)
     until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y")
