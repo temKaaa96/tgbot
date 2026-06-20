@@ -338,7 +338,7 @@ if __name__ == "__main__":
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-@router.message(Command("admin"))
+@router.message(Command(commands=["admin"]))
 async def cmd_admin(msg: Message):
     if not is_admin(msg.from_user.id):
         return
@@ -357,7 +357,7 @@ async def cmd_admin(msg: Message):
         parse_mode="HTML"
     )
 
-@router.message(Command("give"))
+@router.message(Command(commands=["give"]))
 async def cmd_give(msg: Message):
     if not is_admin(msg.from_user.id):
         return
@@ -382,8 +382,7 @@ async def cmd_give(msg: Message):
         await msg.bot.send_message(target_id, f"🎁 Тебе выдана подписка до {until_str}!")
     except:
         pass
-
-@router.message(Command("stats"))
+@router.message(Command(commands=["stats"]))
 async def cmd_stats(msg: Message):
     if not is_admin(msg.from_user.id):
         return
