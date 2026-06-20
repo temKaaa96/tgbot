@@ -387,3 +387,11 @@ async def cmd_stats(msg: Message):
     if not is_admin(msg.from_user.id):
         return
     await cmd_admin(msg)
+async def main():
+    init_db()
+    bot = Bot(token=BOT_TOKEN)
+    log.info("Бот запущен ✅")
+    await router.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
