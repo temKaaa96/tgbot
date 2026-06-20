@@ -19,6 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import httpx
 
 from config import (
+    ADMIN_ID,
     BOT_TOKEN, GROQ_API_KEY, BOT_USERNAME,
     FREE_REQUESTS_PER_DAY, SUBSCRIPTION_PRICE_STARS,
     SUBSCRIPTION_DAYS, REFERRAL_BONUS_DAYS
@@ -300,6 +301,13 @@ async def handle_message(msg: Message):
     upsert_user(user_id, msg.from_user.username or "")
     user = get_user(user_id)
 
+    # Админ имеет безлимит
+    if user_id == ADMIN_ID:
+        await msg.bot.send_chat_action(msg.chat.id, "typing")
+        response = await ask_ai(msg.text)
+        await msg.answer(response)
+        return
+
     if not is_subscribed(user):
         if not check_and_inc_free(user_id):
             await msg.answer(
@@ -322,3 +330,61 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ─── Админ-команды ────────────────────────────────────────────────────────────
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    con = sqlite3.connect("users.db")
+    total = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    subs = con.execute("SELECT COUNT(*) FROM users WHERE sub_until > ?", (datetime.now().isoformat(),)).fetchone()[0]
+    con.close()
+    await msg.answer(
+        f"👑 <b>Админ-панель</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>\n"
+        f"💎 Активных подписок: <b>{subs}</b>\n"
+        f"🆓 Без подписки: <b>{total - subs}</b>\n\n"
+        f"<b>Команды:</b>\n"
+        f"/give [user_id] [дней] — выдать подписку\n"
+        f"/stats — эта статистика",
+        parse_mode="HTML"
+    )
+
+@router.message(Command("give"))
+async def cmd_give(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    args = msg.text.split()
+    if len(args) != 3:
+        await msg.answer("Использование: /give [user_id] [дней]\nПример: /give 123456789 30")
+        return
+    try:
+        target_id = int(args[1])
+        days = int(args[2])
+    except ValueError:
+        await msg.answer("❌ Неверный формат. Пример: /give 123456789 30")
+        return
+    user = get_user(target_id)
+    if not user:
+        await msg.answer(f"❌ Пользователь {target_id} не найден в базе.")
+        return
+    until = activate_subscription(target_id, days)
+    until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y")
+    await msg.answer(f"✅ Пользователю {target_id} выдана подписка до {until_str}")
+    try:
+        await msg.bot.send_message(target_id, f"🎁 Тебе выдана подписка до {until_str}!")
+    except:
+        pass
+
+@router.message(Command("stats"))
+async def cmd_stats(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await cmd_admin(msg)
