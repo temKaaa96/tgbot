@@ -48,7 +48,7 @@ PLANS = {
     },
     "standard": {
         "name": "🔥 Стандарт",
-        "model": "llama-3.2-11b-vision-preview",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "vision": True,
         "files": True,
         "price_stars": 250,
@@ -56,11 +56,11 @@ PLANS = {
     },
     "premium": {
         "name": "👑 Премиум",
-        "model": "llama-3.2-90b-vision-preview",
+        "model": "openai/gpt-oss-120b",
         "vision": True,
         "files": True,
         "price_stars": 450,
-        "desc": "Безлимит, всё + максимум умности"
+        "desc": "Безлимит, топ модель, всё включено"
     }
 }
 
