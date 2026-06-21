@@ -202,13 +202,22 @@ def kb_admin() -> InlineKeyboardMarkup:
     ])
 
 # ─── AI запросы ──────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """Ты дружелюбный AI-ассистент. Общайся живо и эмоционально, используй эмодзи где уместно. Никогда не используй символы * и ** в ответах — вместо выделения текста просто пиши обычным текстом. Отвечай на том же языке что и пользователь."""
+
 async def ask_ai(text: str, model: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": 1024, "messages": [{"role": "user", "content": text}]}
+                json={
+                    "model": model,
+                    "max_tokens": 1024,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": text}
+                    ]
+                }
             )
             return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
@@ -224,13 +233,16 @@ async def ask_ai_vision(text: str, image_b64: str, model: str) -> str:
                 json={
                     "model": model,
                     "max_tokens": 1024,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                            {"type": "text", "text": text or "Опиши что на изображении"}
-                        ]
-                    }]
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                                {"type": "text", "text": text or "Опиши что на изображении"}
+                            ]
+                        }
+                    ]
                 }
             )
             return response.json()["choices"][0]["message"]["content"]
