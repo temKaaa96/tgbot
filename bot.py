@@ -1,15 +1,12 @@
 """
 AI Telegram Bot — тарифы, файлы, фото, стриминг ответов.
-Стек: Python 3.10+, aiogram 3, Groq API + DeepSeek V4 API (OpenAI-совместимый), SQLite.
+Стек: Python 3.10+, aiogram 3, Groq API + OpenModel (DeepSeek V4 Flash), SQLite.
 
-Что нового по сравнению с первой версией:
-  • Премиум работает на DeepSeek V4 (гибрид: глобальные ключи с ротацией + ключ юзера).
-  • Стриминг ответа: бот «печатает» текст вживую, редактируя сообщение.
-  • Markdown → Telegram HTML (жирный, курсив, код-блоки).
-  • Длинные ответы разбиваются на части (лимит Telegram 4096 символов).
-  • Аккуратные карточки меню/статуса/тарифов + полоса лимита для free.
-  • Меню «Настройки» с выбором модели и вставкой своего DeepSeek-ключа.
-  • PDF читается через pypdf, путь к БД вынесен в конфиг (для Railway volume).
+Премиум работает через OpenModel (Anthropic-формат, эндпоинт /v1/messages):
+  • бесплатная модель deepseek-v4-flash (10 RPM / 100K TPM на ключ),
+  • гибрид ключей: глобальные ключи бота (ротация) + ключ юзера,
+  • стриминг ответа, Markdown→HTML, разбивка длинных сообщений,
+  • фото анализируются через vision-модель Groq (OpenModel DeepSeek — текст).
 """
 
 import asyncio
@@ -20,7 +17,6 @@ import json
 import time
 import html
 import re
-import itertools
 import base64
 from datetime import datetime, timedelta
 
@@ -40,59 +36,51 @@ import httpx
 from config import (
     BOT_TOKEN, GROQ_API_KEY, BOT_USERNAME, ADMIN_ID,
     FREE_REQUESTS_PER_DAY, SUBSCRIPTION_DAYS, REFERRAL_BONUS_DAYS,
-    DEEPSEEK_KEYS, DEEPSEEK_PREMIUM_MODEL, DEEPSEEK_FAST_MODEL,
-    DEEPSEEK_BASE_URL, DB_PATH,
+    OPENMODEL_KEYS, OPENMODEL_BASE_URL, PREMIUM_MODEL, PREMIUM_MODEL_PRO,
+    DB_PATH,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEEPSEEK_URL = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+OPENMODEL_MESSAGES_URL = f"{OPENMODEL_BASE_URL.rstrip('/')}/messages"
 
-# Модель для анализа фото (vision). DeepSeek в этой сборке отвечает за текст,
-# а картинки на платных тарифах идут через vision-модель Groq.
+# Модель для анализа фото (vision) — через Groq.
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-# Резервная текстовая модель, если DeepSeek-ключей нет вообще.
+# Резервная текстовая модель, если ключей OpenModel нет вообще.
 GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
 
-TG_LIMIT = 4096          # жёсткий лимит Telegram
-SOFT_LIMIT = 3800        # порог, после которого начинаем новое сообщение
-EDIT_THROTTLE = 1.4      # не редактировать сообщение чаще, чем раз в N секунд
+TG_LIMIT = 4096
+SOFT_LIMIT = 3800
+EDIT_THROTTLE = 1.4
+MAX_TOKENS = 2048
 
 # ─── Тарифы ──────────────────────────────────────────────────────────────────
 PLANS = {
     "free": {
-        "name": "🆓 Бесплатный",
-        "provider": "groq",
+        "name": "🆓 Бесплатный", "provider": "groq",
         "model": "llama-3.1-8b-instant",
-        "vision": False, "files": False, "reasoning": False,
-        "price_stars": 0,
-        "desc": "3 запроса в день · только текст",
+        "vision": False, "files": False,
+        "price_stars": 0, "desc": "3 запроса в день · только текст",
     },
     "basic": {
-        "name": "⚡ Базовый",
-        "provider": "groq",
+        "name": "⚡ Базовый", "provider": "groq",
         "model": "llama-3.3-70b-versatile",
-        "vision": False, "files": True, "reasoning": False,
-        "price_stars": 150,
-        "desc": "Безлимит · текст + файлы",
+        "vision": False, "files": True,
+        "price_stars": 150, "desc": "Безлимит · текст + файлы",
     },
     "standard": {
-        "name": "🔥 Стандарт",
-        "provider": "groq",
+        "name": "🔥 Стандарт", "provider": "groq",
         "model": GROQ_VISION_MODEL,
-        "vision": True, "files": True, "reasoning": False,
-        "price_stars": 250,
-        "desc": "Безлимит · файлы + фото",
+        "vision": True, "files": True,
+        "price_stars": 250, "desc": "Безлимит · файлы + фото",
     },
     "premium": {
-        "name": "👑 Премиум",
-        "provider": "deepseek",
-        "model": DEEPSEEK_PREMIUM_MODEL,
-        "vision": True, "files": True, "reasoning": True,
-        "price_stars": 450,
-        "desc": "DeepSeek V4 · reasoning · всё включено",
+        "name": "👑 Премиум", "provider": "openmodel",
+        "model": PREMIUM_MODEL,
+        "vision": True, "files": True,
+        "price_stars": 450, "desc": "DeepSeek V4 (OpenModel) · всё включено",
     },
 }
 
@@ -101,13 +89,12 @@ USER_COLUMNS = [
     "referred_by", "referral_count", "ds_key", "ds_model",
 ]
 
-# ─── Ротация глобальных ключей DeepSeek ──────────────────────────────────────
+# ─── Ротация глобальных ключей OpenModel ─────────────────────────────────────
 _rr = {"i": 0}
 
 
-def ordered_global_keys() -> list[str]:
-    """Глобальные ключи, начиная с очередного (round-robin)."""
-    keys = list(DEEPSEEK_KEYS)
+def ordered_global_keys() -> list:
+    keys = list(OPENMODEL_KEYS)
     if not keys:
         return []
     i = _rr["i"] % len(keys)
@@ -137,7 +124,6 @@ def init_db():
             referral_count INTEGER DEFAULT 0
         );
     """)
-    # Миграция: добавляем новые колонки, если их ещё нет.
     existing = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
     if "ds_key" not in existing:
         con.execute("ALTER TABLE users ADD COLUMN ds_key TEXT")
@@ -147,16 +133,14 @@ def init_db():
     con.close()
 
 
-def get_user(user_id: int) -> dict | None:
+def get_user(user_id: int):
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
         f"SELECT {', '.join(USER_COLUMNS)} FROM users WHERE user_id=?",
         (user_id,)
     ).fetchone()
     con.close()
-    if not row:
-        return None
-    return dict(zip(USER_COLUMNS, row))
+    return dict(zip(USER_COLUMNS, row)) if row else None
 
 
 def upsert_user(user_id: int, username: str, referred_by: int = None) -> bool:
@@ -182,7 +166,7 @@ def set_user_field(user_id: int, field: str, value):
     con.close()
 
 
-def is_subscribed(user: dict) -> bool:
+def is_subscribed(user) -> bool:
     if not user or not user.get("sub_until") or user.get("plan") == "free":
         return False
     return datetime.fromisoformat(user["sub_until"]) > datetime.now()
@@ -207,7 +191,7 @@ def check_and_inc_free(user_id: int) -> bool:
     return True
 
 
-def free_used_today(user: dict) -> int:
+def free_used_today(user) -> int:
     today = str(datetime.now().date())
     return user["req_today"] if user and user.get("req_date") == today else 0
 
@@ -253,7 +237,7 @@ def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
-def get_user_plan(user: dict) -> dict:
+def get_user_plan(user) -> dict:
     if not user:
         return PLANS["free"]
     if is_subscribed(user):
@@ -263,48 +247,37 @@ def get_user_plan(user: dict) -> dict:
 
 # ─── Форматирование текста ───────────────────────────────────────────────────
 def md_to_html(text: str) -> str:
-    """Аккуратно конвертирует Markdown от модели в безопасный Telegram HTML."""
     if not text:
         return ""
-    blocks: list[str] = []
+    blocks = []
 
-    def keep(s: str) -> str:
+    def keep(s):
         blocks.append(s)
         return f"\uffff{len(blocks) - 1}\uffff"
 
-    # fenced ```code```
     text = re.sub(
         r"```[ \t]*[\w+\-]*\n?(.*?)```",
         lambda m: keep("<pre><code>" + html.escape(m.group(1)) + "</code></pre>"),
         text, flags=re.DOTALL,
     )
-    # inline `code`
     text = re.sub(
         r"`([^`\n]+?)`",
         lambda m: keep("<code>" + html.escape(m.group(1)) + "</code>"),
         text,
     )
-    # экранируем всё остальное
     text = html.escape(text)
-    # заголовки -> жирный
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*(.+?)\s*#*$", r"<b>\1</b>", text)
-    # **жирный** / __жирный__
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", text)
-    # *курсив* / _курсив_  (только если рядом не пробел и не буква/звёздочка)
     text = re.sub(r"(?<![\*\w])\*(?=\S)(.+?)(?<=\S)\*(?![\*\w])", r"<i>\1</i>", text)
     text = re.sub(r"(?<![_\w])_(?=\S)(.+?)(?<=\S)_(?![_\w])", r"<i>\1</i>", text)
-    # ссылки [text](url)
     text = re.sub(r"\[([^\]]+?)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', text)
-    # маркеры списка
     text = re.sub(r"(?m)^\s*[-*]\s+", "• ", text)
-    # возвращаем код на место
     text = re.sub(r"\uffff(\d+)\uffff", lambda m: blocks[int(m.group(1))], text)
     return text
 
 
-def split_text(text: str, limit: int = TG_LIMIT - 200) -> list[str]:
-    """Разбивает длинный текст на части по границам строк."""
+def split_text(text: str, limit: int = TG_LIMIT - 200) -> list:
     if len(text) <= limit:
         return [text]
     parts, cur = [], ""
@@ -323,29 +296,17 @@ def split_text(text: str, limit: int = TG_LIMIT - 200) -> list[str]:
     return parts
 
 
-async def safe_answer(message: Message, text: str, **kwargs):
-    """Отправляет ответ с HTML, при ошибке парсинга — обычным текстом, и режет на части."""
-    chunks = split_text(text)
-    for chunk in chunks:
-        try:
-            await message.answer(md_to_html(chunk), parse_mode="HTML", **kwargs)
-        except TelegramBadRequest:
-            await message.answer(chunk, **kwargs)
-
-
 def usage_bar(used: int, total: int, n: int = 5) -> str:
     filled = min(n, round((used / total) * n)) if total else 0
     return "▓" * filled + "░" * (n - filled) + f"  {used}/{total}"
 
 
-# ─── Стриминг ответа в одно (или несколько) сообщений ────────────────────────
+# ─── Стриминг в одно/несколько сообщений ─────────────────────────────────────
 class TgStreamer:
-    """Печатает ответ модели вживую, редактируя сообщение с троттлингом."""
-
     def __init__(self, placeholder: Message):
         self.current = placeholder
-        self.buffer = ""          # текст текущего сообщения
-        self.full = ""            # весь ответ целиком
+        self.buffer = ""
+        self.full = ""
         self.last_edit = 0.0
         self.last_render = None
         self.dirty = False
@@ -363,8 +324,7 @@ class TgStreamer:
             self.last_render = None
         self.buffer += delta
         self.dirty = True
-        now = time.monotonic()
-        if now - self.last_edit >= EDIT_THROTTLE:
+        if time.monotonic() - self.last_edit >= EDIT_THROTTLE:
             await self._flush()
 
     async def _flush(self, force: bool = False):
@@ -399,18 +359,22 @@ class TgStreamer:
             await self.current.answer(text)
 
 
-# ─── Запросы к моделям (OpenAI-совместимый стриминг) ─────────────────────────
-async def stream_completion(provider: str, model: str, messages: list,
-                            on_delta, api_key: str = None, reasoning: bool = False) -> str:
-    if provider == "groq":
-        url, key = GROQ_URL, GROQ_API_KEY
-    else:
-        url, key = DEEPSEEK_URL, api_key
-
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "max_tokens": 2048, "stream": True}
-    if provider == "deepseek" and reasoning:
-        payload["reasoning_effort"] = "high"
+# ─── Запросы к моделям ───────────────────────────────────────────────────────
+async def stream_completion(fmt: str, model: str, messages: list, on_delta,
+                            api_key: str = None) -> None:
+    """fmt='openai' (Groq /chat/completions) или 'anthropic' (OpenModel /messages)."""
+    if fmt == "openai":
+        url = GROQ_URL
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {"model": model, "messages": messages, "max_tokens": MAX_TOKENS, "stream": True}
+    else:  # anthropic (OpenModel)
+        url = OPENMODEL_MESSAGES_URL
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {"model": model, "max_tokens": MAX_TOKENS, "stream": True, "messages": messages}
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
@@ -419,70 +383,82 @@ async def stream_completion(provider: str, model: str, messages: list,
                 raise ApiError(resp.status_code, body)
             async for line in resp.aiter_lines():
                 line = line.strip()
-                if not line or not line.startswith("data:"):
+                if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
-                if data == "[DONE]":
-                    break
+                if not data or data == "[DONE]":
+                    continue
                 try:
                     obj = json.loads(data)
-                    delta = obj["choices"][0].get("delta", {})
-                    piece = delta.get("content")  # reasoning_content намеренно не показываем
-                    if piece:
-                        await on_delta(piece)
                 except Exception:
                     continue
-    return ""
+                if fmt == "openai":
+                    try:
+                        piece = obj["choices"][0].get("delta", {}).get("content")
+                        if piece:
+                            await on_delta(piece)
+                    except Exception:
+                        continue
+                else:  # anthropic SSE
+                    t = obj.get("type")
+                    if t == "content_block_delta":
+                        d = obj.get("delta", {})
+                        piece = d.get("text") if d.get("type") == "text_delta" else None
+                        if piece:
+                            await on_delta(piece)
+                    elif t == "error":
+                        raise ApiError(500, json.dumps(obj.get("error", {})))
+                    elif t == "message_stop":
+                        break
 
 
-def resolve_text_engine(user: dict, plan: dict, admin: bool):
-    """Возвращает (provider, model, api_key, reasoning) для текстового ответа."""
-    wants_deepseek = admin or plan["provider"] == "deepseek"
-    if wants_deepseek:
+def resolve_text_engine(user, plan: dict, admin: bool):
+    """Возвращает (fmt, model, keys) для текстового ответа."""
+    wants_premium = admin or plan["provider"] == "openmodel"
+    if wants_premium:
+        model = (user.get("ds_model") if user else None) or PREMIUM_MODEL
         if user and user.get("ds_key"):
-            ds_model = user.get("ds_model") or DEEPSEEK_PREMIUM_MODEL
-            return "deepseek", ds_model, [user["ds_key"]], True
+            return "anthropic", model, [user["ds_key"]]
         keys = ordered_global_keys()
         if keys:
-            ds_model = (user.get("ds_model") if user else None) or DEEPSEEK_PREMIUM_MODEL
-            return "deepseek", ds_model, keys, True
-        # ключей нет вообще — отвечаем на резервной модели Groq
-        return "groq", GROQ_FALLBACK_MODEL, None, False
-    return "groq", plan["model"], None, False
+            return "anthropic", model, keys
+        return "openai", GROQ_FALLBACK_MODEL, [None]   # резерв Groq
+    return "openai", plan["model"], [None]
 
 
-async def run_text(msg: Message, messages: list, user: dict, plan: dict, admin: bool):
-    provider, model, keys, reasoning = resolve_text_engine(user, plan, admin)
-    placeholder = await msg.answer("🧠 Думаю…" if reasoning else "✍️ Печатаю…")
+async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
+    fmt, model, keys = resolve_text_engine(user, plan, admin)
+    placeholder = await msg.answer("✍️ Печатаю…")
     streamer = TgStreamer(placeholder)
 
-    candidates = keys if provider == "deepseek" else [None]
     last_err = None
-    for key in candidates:
+    for key in keys:
         try:
-            await stream_completion(provider, model, messages, streamer.push,
-                                    api_key=key, reasoning=reasoning)
+            await stream_completion(fmt, model, messages, streamer.push, api_key=key)
             await streamer.finish()
             return
         except (ApiError, httpx.HTTPError) as e:
             last_err = e
-            if streamer.has_output:   # уже что-то напечатали — не повторяем с другим ключом
+            if streamer.has_output:
                 await streamer.finish()
                 return
             continue
 
     log.error(f"AI error: {last_err}")
-    if isinstance(last_err, ApiError) and last_err.status in (401, 402):
-        await streamer.fail("⚠️ Ключ DeepSeek недействителен или закончился баланс. "
-                            "Проверь ключ в ⚙️ Настройках или обратись к админу.")
+    if isinstance(last_err, ApiError) and last_err.status in (401, 403):
+        await streamer.fail("⚠️ Ключ OpenModel недействителен. Проверь его в ⚙️ Настройках "
+                            "или обратись к админу.")
+    elif isinstance(last_err, ApiError) and last_err.status in (402,):
+        await streamer.fail("⚠️ На ключе закончились кредиты OpenModel. "
+                            "Для бесплатной модели deepseek-v4-flash кредиты не нужны — "
+                            "проверь, что выбрана именно она в ⚙️ Настройках.")
     elif isinstance(last_err, ApiError) and last_err.status == 429:
-        await streamer.fail("⏳ Сейчас слишком много запросов к DeepSeek (лимит ключа). "
-                            "Подожди минуту и попробуй снова.")
+        await streamer.fail("⏳ Превышен лимит запросов (10/мин на ключ). Подожди минуту и попробуй снова.")
     else:
-        await streamer.fail("⚠️ Не получилось получить ответ от AI. Попробуй ещё раз чуть позже.")
+        await streamer.fail("⚠️ Не получилось получить ответ. Попробуй ещё раз чуть позже.")
 
 
-# ─── Vision (анализ фото) ────────────────────────────────────────────────────
+# ─── Vision (фото) — через Groq ──────────────────────────────────────────────
 async def run_vision(msg: Message, caption: str, image_b64: str):
     messages = [{
         "role": "user",
@@ -494,7 +470,7 @@ async def run_vision(msg: Message, caption: str, image_b64: str):
     placeholder = await msg.answer("🖼 Смотрю на фото…")
     streamer = TgStreamer(placeholder)
     try:
-        await stream_completion("groq", GROQ_VISION_MODEL, messages, streamer.push)
+        await stream_completion("openai", GROQ_VISION_MODEL, messages, streamer.push)
         await streamer.finish()
     except (ApiError, httpx.HTTPError) as e:
         log.error(f"Vision error: {e}")
@@ -508,14 +484,15 @@ async def extract_text_from_file(msg: Message, bot: Bot) -> str:
     buf = io.BytesIO()
     await bot.download_file(file.file_path, buf)
     content = buf.getvalue()
+    fname = (doc.file_name or "").lower()
 
-    if doc.mime_type == "text/plain" or (doc.file_name or "").lower().endswith(".txt"):
+    if doc.mime_type == "text/plain" or fname.endswith(".txt"):
         try:
             return content.decode("utf-8")[:8000]
         except UnicodeDecodeError:
             return content.decode("latin-1", "ignore")[:8000]
 
-    if doc.mime_type == "application/pdf" or (doc.file_name or "").lower().endswith(".pdf"):
+    if doc.mime_type == "application/pdf" or fname.endswith(".pdf"):
         try:
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(content))
@@ -566,30 +543,31 @@ def kb_admin() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_settings(user: dict, admin: bool) -> InlineKeyboardMarkup:
+def kb_settings(user, admin: bool) -> InlineKeyboardMarkup:
     rows = []
-    can_deepseek = admin or (is_subscribed(user) and user.get("plan") == "premium")
-    if can_deepseek:
-        cur_model = (user.get("ds_model") or DEEPSEEK_PREMIUM_MODEL) if user else DEEPSEEK_PREMIUM_MODEL
-        pro_mark = "✅" if cur_model == DEEPSEEK_PREMIUM_MODEL else "▫️"
-        fast_mark = "✅" if cur_model == DEEPSEEK_FAST_MODEL else "▫️"
-        rows.append([InlineKeyboardButton(text=f"{pro_mark} Pro (умнее)", callback_data="model_pro"),
-                     InlineKeyboardButton(text=f"{fast_mark} Flash (быстрее)", callback_data="model_fast")])
+    can_premium = admin or (is_subscribed(user) and user.get("plan") == "premium")
+    if can_premium:
+        cur_model = (user.get("ds_model") or PREMIUM_MODEL) if user else PREMIUM_MODEL
+        flash_mark = "✅" if cur_model == PREMIUM_MODEL else "▫️"
+        pro_mark = "✅" if cur_model == PREMIUM_MODEL_PRO else "▫️"
+        rows.append([
+            InlineKeyboardButton(text=f"{flash_mark} Flash (бесплатно)", callback_data="model_fast"),
+            InlineKeyboardButton(text=f"{pro_mark} Pro (кредиты)", callback_data="model_pro"),
+        ])
         if user and user.get("ds_key"):
             rows.append([InlineKeyboardButton(text="🔑 Заменить мой ключ", callback_data="set_ds_key")])
             rows.append([InlineKeyboardButton(text="🗑 Удалить мой ключ", callback_data="del_ds_key")])
         else:
-            rows.append([InlineKeyboardButton(text="🔑 Вставить свой DeepSeek-ключ", callback_data="set_ds_key")])
+            rows.append([InlineKeyboardButton(text="🔑 Вставить свой OpenModel-ключ", callback_data="set_ds_key")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ─── FSM состояния ───────────────────────────────────────────────────────────
+# ─── FSM ─────────────────────────────────────────────────────────────────────
 class SettingsSG(StatesGroup):
     waiting_key = State()
 
 
-# ─── Тексты-карточки ─────────────────────────────────────────────────────────
 def welcome_text(name: str) -> str:
     return (
         f"👋 Привет, <b>{html.escape(name)}</b>!\n\n"
@@ -598,7 +576,7 @@ def welcome_text(name: str) -> str:
         f"🆓 <b>Бесплатно</b> — 3 запроса/день\n"
         f"⚡ <b>Базовый</b> — безлимит + файлы\n"
         f"🔥 <b>Стандарт</b> — + анализ фото\n"
-        f"👑 <b>Премиум</b> — DeepSeek V4, reasoning, всё включено\n"
+        f"👑 <b>Премиум</b> — DeepSeek V4, всё включено\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Просто напиши мне что-нибудь — отвечу 👇"
     )
@@ -607,7 +585,6 @@ def welcome_text(name: str) -> str:
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# ─── /start ──────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
@@ -625,37 +602,32 @@ async def cmd_start(msg: Message, state: FSMContext):
 
     is_new = upsert_user(user_id, username, referred_by)
 
-    if is_new and referred_by:
-        if get_user(referred_by):
-            until = add_referral_bonus(referred_by)
-            until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y")
-            try:
-                await msg.bot.send_message(
-                    referred_by,
-                    f"🎉 По твоей ссылке пришёл новый пользователь!\n"
-                    f"✅ Начислено <b>+{REFERRAL_BONUS_DAYS} дней</b> подписки (до {until_str})",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+    if is_new and referred_by and get_user(referred_by):
+        until = add_referral_bonus(referred_by)
+        until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y")
+        try:
+            await msg.bot.send_message(
+                referred_by,
+                f"🎉 По твоей ссылке пришёл новый пользователь!\n"
+                f"✅ Начислено <b>+{REFERRAL_BONUS_DAYS} дней</b> подписки (до {until_str})",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     await msg.answer(welcome_text(msg.from_user.first_name), parse_mode="HTML",
                      reply_markup=kb_main(user_id))
 
 
-# ─── Тарифы ──────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "plans")
 async def cb_plans(cb: CallbackQuery):
     await cb.message.edit_text(
         "💎 <b>Тарифы</b>\n"
         "━━━━━━━━━━━━━━━\n"
-        "⚡ <b>Базовый</b> — 150 ⭐/мес\n"
-        "  Llama 3.3 70B · безлимит · файлы\n\n"
-        "🔥 <b>Стандарт</b> — 250 ⭐/мес\n"
-        "  + анализ фото\n\n"
-        "👑 <b>Премиум</b> — 450 ⭐/мес\n"
-        "  DeepSeek V4 (reasoning) · топ-качество\n"
-        "  можно подключить свой DeepSeek-ключ\n"
+        "⚡ <b>Базовый</b> — 150 ⭐/мес\n  Llama 3.3 70B · безлимит · файлы\n\n"
+        "🔥 <b>Стандарт</b> — 250 ⭐/мес\n  + анализ фото\n\n"
+        "👑 <b>Премиум</b> — 450 ⭐/мес\n  DeepSeek V4 (OpenModel) · топ-качество\n"
+        "  можно подключить свой OpenModel-ключ\n"
         "━━━━━━━━━━━━━━━\n"
         "Оплата — звёздами Telegram ⭐",
         parse_mode="HTML", reply_markup=kb_plans(),
@@ -695,14 +667,11 @@ async def payment_success(msg: Message):
     until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y")
     await msg.answer(
         f"🎉 <b>Тариф {plan['name']} активирован!</b>\n"
-        f"Действует до {until_str}\n\n"
-        f"Модель: <b>{plan['model']}</b>\n"
-        f"{plan['desc']}",
+        f"Действует до {until_str}\n\nМодель: <b>{plan['model']}</b>\n{plan['desc']}",
         parse_mode="HTML", reply_markup=kb_main(msg.from_user.id),
     )
 
 
-# ─── Статус ──────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "status")
 async def cb_status(cb: CallbackQuery):
     user_id = cb.from_user.id
@@ -713,7 +682,7 @@ async def cb_status(cb: CallbackQuery):
 
     plan = get_user_plan(user)
     if is_admin(user_id):
-        status = "👑 <b>Администратор</b>\n♾️ Безлимит · DeepSeek V4"
+        status = "👑 <b>Администратор</b>\n♾️ Безлимит · DeepSeek V4 (OpenModel)"
     elif is_subscribed(user):
         until = datetime.fromisoformat(user["sub_until"]).strftime("%d.%m.%Y")
         status = f"{plan['name']}\nДо: <b>{until}</b>\nМодель: <code>{plan['model']}</code>"
@@ -730,7 +699,6 @@ async def cb_status(cb: CallbackQuery):
     await cb.answer()
 
 
-# ─── Настройки ───────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "settings")
 async def cb_settings(cb: CallbackQuery):
     user_id = cb.from_user.id
@@ -739,43 +707,43 @@ async def cb_settings(cb: CallbackQuery):
         upsert_user(user_id, cb.from_user.username or "")
         user = get_user(user_id)
     admin = is_admin(user_id)
-    can_deepseek = admin or (is_subscribed(user) and user.get("plan") == "premium")
+    can_premium = admin or (is_subscribed(user) and user.get("plan") == "premium")
 
-    if not can_deepseek:
+    if not can_premium:
         await cb.message.edit_text(
             "⚙️ <b>Настройки</b>\n━━━━━━━━━━━━━━━\n"
-            "Выбор модели и подключение своего DeepSeek-ключа доступны "
+            "Выбор модели и подключение своего OpenModel-ключа доступны "
             "на тарифе 👑 <b>Премиум</b>.",
             parse_mode="HTML", reply_markup=kb_back(),
         )
         await cb.answer()
         return
 
-    cur_model = (user.get("ds_model") or DEEPSEEK_PREMIUM_MODEL)
+    cur_model = (user.get("ds_model") or PREMIUM_MODEL)
     key_state = "свой ключ подключён 🔑" if user.get("ds_key") else "используются ключи бота"
     await cb.message.edit_text(
         "⚙️ <b>Настройки (Премиум)</b>\n━━━━━━━━━━━━━━━\n"
         f"Текущая модель: <code>{cur_model}</code>\n"
         f"Ключ: {key_state}\n━━━━━━━━━━━━━━━\n"
-        "• <b>Pro</b> — максимально умная, но медленнее (reasoning)\n"
-        "• <b>Flash</b> — быстрее и легче по лимитам\n\n"
-        "Можешь вставить свой DeepSeek-ключ — тогда запросы пойдут через него.",
+        "• <b>Flash</b> — DeepSeek V4 Flash, бесплатно (10 запросов/мин)\n"
+        "• <b>Pro</b> — точнее, но тратит кредиты OpenModel\n\n"
+        "Можешь вставить свой OpenModel-ключ (om-…) — тогда запросы пойдут через него.",
         parse_mode="HTML", reply_markup=kb_settings(user, admin),
     )
     await cb.answer()
 
 
-@dp.callback_query(F.data == "model_pro")
-async def cb_model_pro(cb: CallbackQuery):
-    set_user_field(cb.from_user.id, "ds_model", DEEPSEEK_PREMIUM_MODEL)
-    await cb.answer("Модель: Pro (умнее) ✅")
+@dp.callback_query(F.data == "model_fast")
+async def cb_model_fast(cb: CallbackQuery):
+    set_user_field(cb.from_user.id, "ds_model", PREMIUM_MODEL)
+    await cb.answer("Модель: Flash (бесплатно) ✅")
     await cb_settings(cb)
 
 
-@dp.callback_query(F.data == "model_fast")
-async def cb_model_fast(cb: CallbackQuery):
-    set_user_field(cb.from_user.id, "ds_model", DEEPSEEK_FAST_MODEL)
-    await cb.answer("Модель: Flash (быстрее) ✅")
+@dp.callback_query(F.data == "model_pro")
+async def cb_model_pro(cb: CallbackQuery):
+    set_user_field(cb.from_user.id, "ds_model", PREMIUM_MODEL_PRO)
+    await cb.answer("Модель: Pro (тратит кредиты) ✅")
     await cb_settings(cb)
 
 
@@ -790,15 +758,14 @@ async def cb_del_key(cb: CallbackQuery):
 async def cb_set_key(cb: CallbackQuery, state: FSMContext):
     user = get_user(cb.from_user.id)
     admin = is_admin(cb.from_user.id)
-    can_deepseek = admin or (is_subscribed(user) and user.get("plan") == "premium")
-    if not can_deepseek:
+    can_premium = admin or (is_subscribed(user) and user.get("plan") == "premium")
+    if not can_premium:
         await cb.answer("Доступно на Премиуме", show_alert=True)
         return
     await state.set_state(SettingsSG.waiting_key)
     await cb.message.answer(
-        "🔑 Пришли свой ключ DeepSeek одним сообщением (начинается с <code>sk-</code>).\n"
-        "Получить можно на platform.deepseek.com.\n\n"
-        "Чтобы отменить — отправь /cancel",
+        "🔑 Пришли свой ключ OpenModel одним сообщением (начинается с <code>om-</code>).\n"
+        "Получить можно на console.openmodel.ai.\n\nЧтобы отменить — отправь /cancel",
         parse_mode="HTML",
     )
     await cb.answer()
@@ -815,13 +782,13 @@ async def cmd_cancel(msg: Message, state: FSMContext):
 async def receive_ds_key(msg: Message, state: FSMContext):
     key = msg.text.strip()
     await state.clear()
-    # пробуем удалить сообщение с ключом, чтобы оно не висело в истории
     try:
         await msg.delete()
     except TelegramBadRequest:
         pass
-    if not key.startswith("sk-") or len(key) < 12:
-        await msg.answer("❌ Это не похоже на ключ DeepSeek (должен начинаться с sk-). Попробуй ещё раз через ⚙️ Настройки.")
+    if not (key.startswith("om-") and len(key) >= 12):
+        await msg.answer("❌ Это не похоже на ключ OpenModel (должен начинаться с om-). "
+                         "Попробуй ещё раз через ⚙️ Настройки.")
         return
     set_user_field(msg.from_user.id, "ds_key", key)
     await msg.answer("✅ Ключ сохранён. Теперь Премиум-запросы идут через твой ключ.\n"
@@ -829,7 +796,6 @@ async def receive_ds_key(msg: Message, state: FSMContext):
                      reply_markup=kb_main(msg.from_user.id))
 
 
-# ─── Реферальная программа / навигация ───────────────────────────────────────
 @dp.callback_query(F.data == "referral")
 async def cb_referral(cb: CallbackQuery):
     user = get_user(cb.from_user.id) or {"referral_count": 0}
@@ -851,14 +817,13 @@ async def cb_back(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ─── Админка ─────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "admin_panel")
 async def cb_admin_panel(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("⛔ Нет доступа", show_alert=True)
         return
     stats = get_stats()
-    keys_note = f"{len(DEEPSEEK_KEYS)} шт." if DEEPSEEK_KEYS else "не заданы ⚠️"
+    keys_note = f"{len(OPENMODEL_KEYS)} шт." if OPENMODEL_KEYS else "не заданы ⚠️"
     await cb.message.edit_text(
         f"👑 <b>Админ-панель</b>\n━━━━━━━━━━━━━━━\n"
         f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
@@ -866,7 +831,7 @@ async def cb_admin_panel(cb: CallbackQuery):
         f"⚡ Базовых: <b>{stats['by_plan']['basic']}</b>\n"
         f"🔥 Стандарт: <b>{stats['by_plan']['standard']}</b>\n"
         f"👑 Премиум: <b>{stats['by_plan']['premium']}</b>\n\n"
-        f"🔑 Глобальных DeepSeek-ключей: <b>{keys_note}</b>\n━━━━━━━━━━━━━━━\n"
+        f"🔑 Ключей OpenModel: <b>{keys_note}</b>\n━━━━━━━━━━━━━━━\n"
         f"Выдать подписку:\n<code>/give USER_ID план дней</code>\n"
         f"Планы: basic, standard, premium\n"
         f"Пример: <code>/give 123456789 premium 30</code>",
@@ -913,7 +878,6 @@ async def cmd_give(msg: Message):
         pass
 
 
-# ─── Контент: фото / документы / текст ───────────────────────────────────────
 @dp.message(F.photo)
 async def handle_photo(msg: Message, bot: Bot):
     user_id = msg.from_user.id
@@ -992,11 +956,10 @@ async def handle_message(msg: Message):
     await run_text(msg, messages, user, plan, admin)
 
 
-# ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main():
     init_db()
-    if not DEEPSEEK_KEYS:
-        log.warning("DEEPSEEK_KEYS не заданы — Премиум будет отвечать на резервной модели Groq.")
+    if not OPENMODEL_KEYS:
+        log.warning("OPENMODEL_KEYS не заданы — Премиум будет отвечать на резервной модели Groq.")
     bot = Bot(token=BOT_TOKEN)
     log.info("Бот запущен ✅")
     await dp.start_polling(bot)
