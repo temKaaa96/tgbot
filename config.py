@@ -17,7 +17,13 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "8926744054"))
 #   OPENMODEL_KEYS="om-aaa,om-bbb"
 # Они крутятся по кругу (ротация), т.к. у бесплатного DeepSeek V4 Flash лимит
 # 10 запросов/мин на ключ — несколько ключей расширяют этот потолок.
-OPENMODEL_KEYS = [k.strip() for k in os.environ.get("OPENMODEL_KEYS", "").split(",") if k.strip()]
+def _clean_key(k: str) -> str:
+    k = k.strip().strip('"').strip("'").strip()
+    if k.lower().startswith("bearer "):
+        k = k[7:].strip()
+    return k
+
+OPENMODEL_KEYS = [_clean_key(k) for k in os.environ.get("OPENMODEL_KEYS", "").split(",") if _clean_key(k)]
 
 # Базовый URL OpenModel (Anthropic-совместимый). Эндпоинт — /messages.
 OPENMODEL_BASE_URL = os.environ.get("OPENMODEL_BASE_URL", "https://api.openmodel.ai/v1")

@@ -56,6 +56,10 @@ SOFT_LIMIT = 3800
 EDIT_THROTTLE = 1.4
 MAX_TOKENS = 2048
 
+# Память диалога
+MAX_HISTORY = 12        # сколько последних сообщений помнить (user + assistant вместе)
+MAX_HIST_CHARS = 4000   # макс длина одного сообщения, сохраняемого в историю
+
 # ─── Тарифы ──────────────────────────────────────────────────────────────────
 PLANS = {
     "free": {
@@ -129,6 +133,16 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN ds_key TEXT")
     if "ds_model" not in existing:
         con.execute("ALTER TABLE users ADD COLUMN ds_model TEXT")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role    TEXT,
+            content TEXT,
+            ts      TEXT
+        );
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id, id)")
     con.commit()
     con.close()
 
@@ -162,6 +176,45 @@ def set_user_field(user_id: int, field: str, value):
         raise ValueError("forbidden field")
     con = sqlite3.connect(DB_PATH)
     con.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
+    con.commit()
+    con.close()
+
+
+# ─── История диалога ─────────────────────────────────────────────────────────
+def add_history(user_id: int, role: str, content: str):
+    content = (content or "")[:MAX_HIST_CHARS]
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT INTO history (user_id, role, content, ts) VALUES (?,?,?,?)",
+        (user_id, role, content, datetime.now().isoformat()),
+    )
+    # оставляем только последние MAX_HISTORY сообщений пользователя
+    con.execute(
+        "DELETE FROM history WHERE user_id=? AND id NOT IN "
+        "(SELECT id FROM history WHERE user_id=? ORDER BY id DESC LIMIT ?)",
+        (user_id, user_id, MAX_HISTORY),
+    )
+    con.commit()
+    con.close()
+
+
+def get_history(user_id: int) -> list:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT role, content FROM history WHERE user_id=? ORDER BY id ASC LIMIT ?",
+        (user_id, MAX_HISTORY),
+    ).fetchall()
+    con.close()
+    msgs = [{"role": r, "content": c} for r, c in rows]
+    # Anthropic-формат требует, чтобы первым шёл user — срезаем ведущие assistant
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    return msgs
+
+
+def clear_history(user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM history WHERE user_id=?", (user_id,))
     con.commit()
     con.close()
 
@@ -436,12 +489,12 @@ async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
         try:
             await stream_completion(fmt, model, messages, streamer.push, api_key=key)
             await streamer.finish()
-            return
+            return streamer.full
         except (ApiError, httpx.HTTPError) as e:
             last_err = e
             if streamer.has_output:
                 await streamer.finish()
-                return
+                return streamer.full
             continue
 
     log.error(f"AI error: {last_err}")
@@ -456,6 +509,7 @@ async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
         await streamer.fail("⏳ Превышен лимит запросов (10/мин на ключ). Подожди минуту и попробуй снова.")
     else:
         await streamer.fail("⚠️ Не получилось получить ответ. Попробуй ещё раз чуть позже.")
+    return None
 
 
 # ─── Vision (фото) — через Groq ──────────────────────────────────────────────
@@ -515,6 +569,7 @@ def kb_main(user_id: int) -> InlineKeyboardMarkup:
     buttons.extend([
         [InlineKeyboardButton(text="💎 Тарифы и подписка", callback_data="plans")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="🧹 Очистить диалог", callback_data="reset_dialog")],
         [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referral")],
         [InlineKeyboardButton(text="📊 Мой статус", callback_data="status")],
     ])
@@ -778,6 +833,18 @@ async def cmd_cancel(msg: Message, state: FSMContext):
         await msg.answer("Отменено.", reply_markup=kb_main(msg.from_user.id))
 
 
+@dp.message(Command("reset"))
+async def cmd_reset(msg: Message):
+    clear_history(msg.from_user.id)
+    await msg.answer("🧹 История диалога очищена. Начинаем с чистого листа.")
+
+
+@dp.callback_query(F.data == "reset_dialog")
+async def cb_reset(cb: CallbackQuery):
+    clear_history(cb.from_user.id)
+    await cb.answer("🧹 Диалог очищен", show_alert=True)
+
+
 @dp.message(StateFilter(SettingsSG.waiting_key), F.text)
 async def receive_ds_key(msg: Message, state: FSMContext):
     key = msg.text.strip()
@@ -952,8 +1019,12 @@ async def handle_message(msg: Message):
         plan = PLANS["premium"]
 
     await msg.bot.send_chat_action(msg.chat.id, "typing")
-    messages = [{"role": "user", "content": msg.text}]
-    await run_text(msg, messages, user, plan, admin)
+    history = get_history(user_id)
+    messages = history + [{"role": "user", "content": msg.text}]
+    reply = await run_text(msg, messages, user, plan, admin)
+    if reply:
+        add_history(user_id, "user", msg.text)
+        add_history(user_id, "assistant", reply)
 
 
 async def main():
