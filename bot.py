@@ -48,6 +48,8 @@ OPENMODEL_MESSAGES_URL = f"{OPENMODEL_BASE_URL.rstrip('/')}/messages"
 
 # Модель для анализа фото (vision) — через Groq.
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Распознавание голоса (Speech-to-Text) — через Groq, бесплатно.
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 # Резервная текстовая модель, если ключей OpenModel нет вообще.
 GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
 
@@ -363,10 +365,27 @@ class TgStreamer:
         self.last_edit = 0.0
         self.last_render = None
         self.dirty = False
+        self.last_think = 0.0
+        self.think_step = 0
 
     @property
     def has_output(self) -> bool:
         return bool(self.full)
+
+    async def think(self, _piece: str = None):
+        """Анимация «🧠 Думаю…», пока модель размышляет и текста ещё нет."""
+        if self.full:
+            return
+        now = time.monotonic()
+        if now - self.last_think < EDIT_THROTTLE:
+            return
+        self.think_step = (self.think_step + 1) % 3
+        dots = "." * (self.think_step + 1)
+        try:
+            await self.current.edit_text(f"🧠 Думаю{dots}")
+        except (TelegramBadRequest, TelegramRetryAfter):
+            pass
+        self.last_think = now
 
     async def push(self, delta: str):
         self.full += delta
@@ -414,7 +433,7 @@ class TgStreamer:
 
 # ─── Запросы к моделям ───────────────────────────────────────────────────────
 async def stream_completion(fmt: str, model: str, messages: list, on_delta,
-                            api_key: str = None) -> None:
+                            api_key: str = None, on_thinking=None) -> None:
     """fmt='openai' (Groq /chat/completions) или 'anthropic' (OpenModel /messages)."""
     if fmt == "openai":
         url = GROQ_URL
@@ -456,9 +475,11 @@ async def stream_completion(fmt: str, model: str, messages: list, on_delta,
                     t = obj.get("type")
                     if t == "content_block_delta":
                         d = obj.get("delta", {})
-                        piece = d.get("text") if d.get("type") == "text_delta" else None
-                        if piece:
-                            await on_delta(piece)
+                        dtype = d.get("type")
+                        if dtype == "text_delta" and d.get("text"):
+                            await on_delta(d["text"])
+                        elif dtype == "thinking_delta" and on_thinking:
+                            await on_thinking(d.get("thinking", ""))
                     elif t == "error":
                         raise ApiError(500, json.dumps(obj.get("error", {})))
                     elif t == "message_stop":
@@ -481,15 +502,19 @@ def resolve_text_engine(user, plan: dict, admin: bool):
 
 async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
     fmt, model, keys = resolve_text_engine(user, plan, admin)
-    placeholder = await msg.answer("✍️ Печатаю…")
+    placeholder = await msg.answer("🧠 Думаю…" if fmt == "anthropic" else "✍️ Печатаю…")
     streamer = TgStreamer(placeholder)
 
     last_err = None
     for key in keys:
         try:
-            await stream_completion(fmt, model, messages, streamer.push, api_key=key)
+            await stream_completion(fmt, model, messages, streamer.push,
+                                    api_key=key, on_thinking=streamer.think)
             await streamer.finish()
-            return streamer.full
+            if streamer.full:
+                return streamer.full
+            await streamer.fail("⚠️ Модель не вернула ответ. Попробуй переформулировать.")
+            return None
         except (ApiError, httpx.HTTPError) as e:
             last_err = e
             if streamer.has_output:
@@ -558,7 +583,41 @@ async def extract_text_from_file(msg: Message, bot: Bot) -> str:
             log.error(f"PDF error: {e}")
         return "⚠️ Не удалось извлечь текст из PDF (возможно, это скан без текстового слоя)."
 
-    return f"⚠️ Тип файла «{doc.mime_type}» не поддерживается. Поддерживаются: TXT, PDF."
+    DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if doc.mime_type == DOCX_MIME or fname.endswith(".docx"):
+        try:
+            from docx import Document
+            d = Document(io.BytesIO(content))
+            parts = [p.text for p in d.paragraphs if p.text.strip()]
+            for table in d.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            result = "\n".join(parts).strip()
+            if len(result) > 10:
+                return result[:8000]
+        except Exception as e:
+            log.error(f"DOCX error: {e}")
+        return "⚠️ Не удалось прочитать DOCX-файл."
+
+    if fname.endswith(".doc"):
+        return "⚠️ Старый формат .doc не поддерживается. Пересохрани файл как .docx (Файл → Сохранить как)."
+
+    return f"⚠️ Тип файла «{doc.mime_type}» не поддерживается. Поддерживаются: TXT, PDF, DOCX."
+
+
+# ─── Распознавание голоса (Groq Whisper) ─────────────────────────────────────
+async def transcribe_voice(content: bytes, filename: str = "voice.ogg") -> str:
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    files = {"file": (filename, content, "audio/ogg")}
+    data = {"model": GROQ_WHISPER_MODEL, "response_format": "json"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
+        resp = await client.post(url, headers=headers, files=files, data=data)
+        if resp.status_code >= 400:
+            raise ApiError(resp.status_code, resp.text)
+        return (resp.json().get("text") or "").strip()
 
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
@@ -996,6 +1055,51 @@ async def handle_document(msg: Message, bot: Bot):
     caption = msg.caption or "Проанализируй этот текст и кратко изложи суть."
     messages = [{"role": "user", "content": f"{caption}\n\n---\n{text}"}]
     await run_text(msg, messages, user, plan, admin)
+
+
+@dp.message(F.voice | F.audio)
+async def handle_voice(msg: Message, bot: Bot):
+    user_id = msg.from_user.id
+    upsert_user(user_id, msg.from_user.username or "")
+    user = get_user(user_id)
+    admin = is_admin(user_id)
+
+    if not admin:
+        plan = get_user_plan(user)
+        if not is_subscribed(user) and not check_and_inc_free(user_id):
+            await msg.answer(
+                f"⛔ Бесплатный лимит исчерпан ({FREE_REQUESTS_PER_DAY} запроса/день).\n\n"
+                f"Выбери тариф для продолжения 👇",
+                reply_markup=kb_plans(),
+            )
+            return
+    else:
+        plan = PLANS["premium"]
+
+    media = msg.voice or msg.audio
+    status = await msg.answer("🎤 Распознаю голос…")
+    try:
+        file = await bot.get_file(media.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        text = await transcribe_voice(buf.getvalue(),
+                                      getattr(media, "file_name", None) or "voice.ogg")
+    except (ApiError, httpx.HTTPError) as e:
+        log.error(f"STT error: {e}")
+        await status.edit_text("⚠️ Не удалось распознать голос. Попробуй ещё раз.")
+        return
+
+    if not text:
+        await status.edit_text("🤷 Не расслышал. Запиши ещё раз почётче.")
+        return
+
+    await status.edit_text(f"🎤 <i>Распознал:</i> {html.escape(text)}", parse_mode="HTML")
+    history = get_history(user_id)
+    messages = history + [{"role": "user", "content": text}]
+    reply = await run_text(msg, messages, user, plan, admin)
+    if reply:
+        add_history(user_id, "user", text)
+        add_history(user_id, "assistant", reply)
 
 
 @dp.message(StateFilter(None), F.text & ~F.text.startswith("/"))
