@@ -1,12 +1,12 @@
 """
 AI Telegram Bot — тарифы, файлы, фото, стриминг ответов.
-Стек: Python 3.10+, aiogram 3, Groq API + OpenModel (DeepSeek V4 Flash), SQLite.
+Стек: Python 3.10+, aiogram 3, Groq API + Google Gemini (OpenAI-совместимый), SQLite.
 
-Премиум работает через OpenModel (Anthropic-формат, эндпоинт /v1/messages):
-  • бесплатная модель deepseek-v4-flash (10 RPM / 100K TPM на ключ),
-  • гибрид ключей: глобальные ключи бота (ротация) + ключ юзера,
+Премиум работает через Gemini (бесплатный тариф Google AI Studio):
+  • модель gemini-2.5-flash (без карты, ~1500 запросов/день),
+  • один легальный ключ (или ключ юзера); фолбэк на Groq, если ключа нет,
   • стриминг ответа, Markdown→HTML, разбивка длинных сообщений,
-  • фото анализируются через vision-модель Groq (OpenModel DeepSeek — текст).
+  • фото анализируются через vision-модель Groq.
 """
 
 import asyncio
@@ -36,7 +36,7 @@ import httpx
 from config import (
     BOT_TOKEN, GROQ_API_KEY, BOT_USERNAME, ADMIN_ID,
     FREE_REQUESTS_PER_DAY, SUBSCRIPTION_DAYS, REFERRAL_BONUS_DAYS,
-    OPENMODEL_KEYS, OPENMODEL_BASE_URL, PREMIUM_MODEL, PREMIUM_MODEL_PRO,
+    GEMINI_API_KEY, GEMINI_BASE_URL, GEMINI_PREMIUM_MODEL, GEMINI_FAST_MODEL,
     DB_PATH,
 )
 
@@ -44,13 +44,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-OPENMODEL_MESSAGES_URL = f"{OPENMODEL_BASE_URL.rstrip('/')}/messages"
+GEMINI_NATIVE_BASE = GEMINI_BASE_URL.rstrip("/")  # native эндпоинт Gemini
+
+# Провайдеры в OpenAI-совместимом формате (Gemini обрабатывается отдельно — native).
+ENDPOINTS = {
+    "groq": (GROQ_URL, GROQ_API_KEY),
+}
 
 # Модель для анализа фото (vision) — через Groq.
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Распознавание голоса (Speech-to-Text) — через Groq, бесплатно.
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
-# Резервная текстовая модель, если ключей OpenModel нет вообще.
+# Резервная текстовая модель, если ключа Gemini нет вообще.
 GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
 
 TG_LIMIT = 4096
@@ -83,10 +88,10 @@ PLANS = {
         "price_stars": 250, "desc": "Безлимит · файлы + фото",
     },
     "premium": {
-        "name": "👑 Премиум", "provider": "openmodel",
-        "model": PREMIUM_MODEL,
+        "name": "👑 Премиум", "provider": "gemini",
+        "model": GEMINI_PREMIUM_MODEL,
         "vision": True, "files": True,
-        "price_stars": 450, "desc": "DeepSeek V4 (OpenModel) · всё включено",
+        "price_stars": 450, "desc": "Gemini 2.5 Flash · всё включено",
     },
 }
 
@@ -94,19 +99,6 @@ USER_COLUMNS = [
     "user_id", "username", "plan", "sub_until", "req_today", "req_date",
     "referred_by", "referral_count", "ds_key", "ds_model",
 ]
-
-# ─── Ротация глобальных ключей OpenModel ─────────────────────────────────────
-_rr = {"i": 0}
-
-
-def ordered_global_keys() -> list:
-    keys = list(OPENMODEL_KEYS)
-    if not keys:
-        return []
-    i = _rr["i"] % len(keys)
-    _rr["i"] = (_rr["i"] + 1) % len(keys)
-    return keys[i:] + keys[:i]
-
 
 class ApiError(Exception):
     def __init__(self, status: int, body: str = ""):
@@ -131,10 +123,20 @@ def init_db():
         );
     """)
     existing = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
-    if "ds_key" not in existing:
-        con.execute("ALTER TABLE users ADD COLUMN ds_key TEXT")
-    if "ds_model" not in existing:
-        con.execute("ALTER TABLE users ADD COLUMN ds_model TEXT")
+    # авто-миграция: добавляем любые недостающие колонки (для старых баз)
+    migrations = {
+        "plan": "TEXT DEFAULT 'free'",
+        "sub_until": "TEXT",
+        "req_today": "INTEGER DEFAULT 0",
+        "req_date": "TEXT",
+        "referred_by": "INTEGER DEFAULT NULL",
+        "referral_count": "INTEGER DEFAULT 0",
+        "ds_key": "TEXT",
+        "ds_model": "TEXT",
+    }
+    for col, decl in migrations.items():
+        if col not in existing:
+            con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -432,21 +434,58 @@ class TgStreamer:
 
 
 # ─── Запросы к моделям ───────────────────────────────────────────────────────
-async def stream_completion(fmt: str, model: str, messages: list, on_delta,
-                            api_key: str = None, on_thinking=None) -> None:
-    """fmt='openai' (Groq /chat/completions) или 'anthropic' (OpenModel /messages)."""
-    if fmt == "openai":
-        url = GROQ_URL
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages, "max_tokens": MAX_TOKENS, "stream": True}
-    else:  # anthropic (OpenModel)
-        url = OPENMODEL_MESSAGES_URL
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        payload = {"model": model, "max_tokens": MAX_TOKENS, "stream": True, "messages": messages}
+def to_gemini_contents(messages: list) -> list:
+    """OpenAI-стиль (user/assistant) -> Gemini native (user/model + parts)."""
+    contents = []
+    for m in messages:
+        role = "model" if m.get("role") == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+    return contents
+
+
+async def _stream_gemini(model: str, messages: list, on_delta, api_key: str = None):
+    """Родной Gemini API (работает с ключами AIza и AQ.)."""
+    key = api_key or GEMINI_API_KEY
+    url = f"{GEMINI_NATIVE_BASE}/models/{model}:streamGenerateContent?alt=sse"
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    payload = {
+        "contents": to_gemini_contents(messages),
+        "generationConfig": {
+            "maxOutputTokens": MAX_TOKENS,
+            "thinkingConfig": {"thinkingBudget": 0},  # без «размышлений» — быстрее и весь бюджет на ответ
+        },
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
+        async with client.stream("POST", url, headers=headers, json=payload) as resp:
+            if resp.status_code >= 400:
+                raise ApiError(resp.status_code, (await resp.aread()).decode("utf-8", "ignore"))
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                try:
+                    obj = json.loads(data)
+                    for part in obj["candidates"][0]["content"]["parts"]:
+                        if part.get("text") and not part.get("thought"):
+                            await on_delta(part["text"])
+                except Exception:
+                    continue
+
+
+async def stream_completion(provider: str, model: str, messages: list, on_delta,
+                            api_key: str = None) -> None:
+    """Groq — OpenAI-формат; Gemini — родной API."""
+    if provider == "gemini":
+        await _stream_gemini(model, messages, on_delta, api_key)
+        return
+
+    url, default_key = ENDPOINTS[provider]
+    key = api_key or default_key
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "max_tokens": MAX_TOKENS, "stream": True}
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
@@ -461,55 +500,34 @@ async def stream_completion(fmt: str, model: str, messages: list, on_delta,
                 if not data or data == "[DONE]":
                     continue
                 try:
-                    obj = json.loads(data)
+                    piece = json.loads(data)["choices"][0].get("delta", {}).get("content")
+                    if piece:
+                        await on_delta(piece)
                 except Exception:
                     continue
-                if fmt == "openai":
-                    try:
-                        piece = obj["choices"][0].get("delta", {}).get("content")
-                        if piece:
-                            await on_delta(piece)
-                    except Exception:
-                        continue
-                else:  # anthropic SSE
-                    t = obj.get("type")
-                    if t == "content_block_delta":
-                        d = obj.get("delta", {})
-                        dtype = d.get("type")
-                        if dtype == "text_delta" and d.get("text"):
-                            await on_delta(d["text"])
-                        elif dtype == "thinking_delta" and on_thinking:
-                            await on_thinking(d.get("thinking", ""))
-                    elif t == "error":
-                        raise ApiError(500, json.dumps(obj.get("error", {})))
-                    elif t == "message_stop":
-                        break
 
 
 def resolve_text_engine(user, plan: dict, admin: bool):
-    """Возвращает (fmt, model, keys) для текстового ответа."""
-    wants_premium = admin or plan["provider"] == "openmodel"
+    """Возвращает (provider, model, keys) для текстового ответа."""
+    wants_premium = admin or plan["provider"] == "gemini"
     if wants_premium:
-        model = (user.get("ds_model") if user else None) or PREMIUM_MODEL
-        if user and user.get("ds_key"):
-            return "anthropic", model, [user["ds_key"]]
-        keys = ordered_global_keys()
-        if keys:
-            return "anthropic", model, keys
-        return "openai", GROQ_FALLBACK_MODEL, [None]   # резерв Groq
-    return "openai", plan["model"], [None]
+        model = (user.get("ds_model") if user else None) or GEMINI_PREMIUM_MODEL
+        key = (user.get("ds_key") if user else None) or GEMINI_API_KEY
+        if key:
+            return "gemini", model, [key]
+        return "groq", GROQ_FALLBACK_MODEL, [None]   # резерв Groq, если нет ключа Gemini
+    return "groq", plan["model"], [None]
 
 
 async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
-    fmt, model, keys = resolve_text_engine(user, plan, admin)
-    placeholder = await msg.answer("🧠 Думаю…" if fmt == "anthropic" else "✍️ Печатаю…")
+    provider, model, keys = resolve_text_engine(user, plan, admin)
+    placeholder = await msg.answer("✍️ Печатаю…")
     streamer = TgStreamer(placeholder)
 
     last_err = None
     for key in keys:
         try:
-            await stream_completion(fmt, model, messages, streamer.push,
-                                    api_key=key, on_thinking=streamer.think)
+            await stream_completion(provider, model, messages, streamer.push, api_key=key)
             await streamer.finish()
             if streamer.full:
                 return streamer.full
@@ -524,14 +542,11 @@ async def run_text(msg: Message, messages: list, user, plan: dict, admin: bool):
 
     log.error(f"AI error: {last_err}")
     if isinstance(last_err, ApiError) and last_err.status in (401, 403):
-        await streamer.fail("⚠️ Ключ OpenModel недействителен. Проверь его в ⚙️ Настройках "
+        await streamer.fail("⚠️ Ключ Gemini недействителен. Проверь его в ⚙️ Настройках "
                             "или обратись к админу.")
-    elif isinstance(last_err, ApiError) and last_err.status in (402,):
-        await streamer.fail("⚠️ На ключе закончились кредиты OpenModel. "
-                            "Для бесплатной модели deepseek-v4-flash кредиты не нужны — "
-                            "проверь, что выбрана именно она в ⚙️ Настройках.")
     elif isinstance(last_err, ApiError) and last_err.status == 429:
-        await streamer.fail("⏳ Превышен лимит запросов (10/мин на ключ). Подожди минуту и попробуй снова.")
+        await streamer.fail("⏳ Превышен бесплатный лимит Gemini (15 запросов/мин или 1500/день). "
+                            "Подожди минуту и попробуй снова.")
     else:
         await streamer.fail("⚠️ Не получилось получить ответ. Попробуй ещё раз чуть позже.")
     return None
@@ -549,7 +564,7 @@ async def run_vision(msg: Message, caption: str, image_b64: str):
     placeholder = await msg.answer("🖼 Смотрю на фото…")
     streamer = TgStreamer(placeholder)
     try:
-        await stream_completion("openai", GROQ_VISION_MODEL, messages, streamer.push)
+        await stream_completion("groq", GROQ_VISION_MODEL, messages, streamer.push)
         await streamer.finish()
     except (ApiError, httpx.HTTPError) as e:
         log.error(f"Vision error: {e}")
@@ -661,18 +676,18 @@ def kb_settings(user, admin: bool) -> InlineKeyboardMarkup:
     rows = []
     can_premium = admin or (is_subscribed(user) and user.get("plan") == "premium")
     if can_premium:
-        cur_model = (user.get("ds_model") or PREMIUM_MODEL) if user else PREMIUM_MODEL
-        flash_mark = "✅" if cur_model == PREMIUM_MODEL else "▫️"
-        pro_mark = "✅" if cur_model == PREMIUM_MODEL_PRO else "▫️"
+        cur_model = (user.get("ds_model") or GEMINI_PREMIUM_MODEL) if user else GEMINI_PREMIUM_MODEL
+        flash_mark = "✅" if cur_model == GEMINI_PREMIUM_MODEL else "▫️"
+        lite_mark = "✅" if cur_model == GEMINI_FAST_MODEL else "▫️"
         rows.append([
-            InlineKeyboardButton(text=f"{flash_mark} Flash (бесплатно)", callback_data="model_fast"),
-            InlineKeyboardButton(text=f"{pro_mark} Pro (кредиты)", callback_data="model_pro"),
+            InlineKeyboardButton(text=f"{flash_mark} Flash (умнее)", callback_data="model_fast"),
+            InlineKeyboardButton(text=f"{lite_mark} Flash-Lite (быстрее)", callback_data="model_pro"),
         ])
         if user and user.get("ds_key"):
             rows.append([InlineKeyboardButton(text="🔑 Заменить мой ключ", callback_data="set_ds_key")])
             rows.append([InlineKeyboardButton(text="🗑 Удалить мой ключ", callback_data="del_ds_key")])
         else:
-            rows.append([InlineKeyboardButton(text="🔑 Вставить свой OpenModel-ключ", callback_data="set_ds_key")])
+            rows.append([InlineKeyboardButton(text="🔑 Вставить свой Gemini-ключ", callback_data="set_ds_key")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -690,7 +705,7 @@ def welcome_text(name: str) -> str:
         f"🆓 <b>Бесплатно</b> — 3 запроса/день\n"
         f"⚡ <b>Базовый</b> — безлимит + файлы\n"
         f"🔥 <b>Стандарт</b> — + анализ фото\n"
-        f"👑 <b>Премиум</b> — DeepSeek V4, всё включено\n"
+        f"👑 <b>Премиум</b> — Gemini 2.5 Flash, всё включено\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Просто напиши мне что-нибудь — отвечу 👇"
     )
@@ -740,8 +755,8 @@ async def cb_plans(cb: CallbackQuery):
         "━━━━━━━━━━━━━━━\n"
         "⚡ <b>Базовый</b> — 150 ⭐/мес\n  Llama 3.3 70B · безлимит · файлы\n\n"
         "🔥 <b>Стандарт</b> — 250 ⭐/мес\n  + анализ фото\n\n"
-        "👑 <b>Премиум</b> — 450 ⭐/мес\n  DeepSeek V4 (OpenModel) · топ-качество\n"
-        "  можно подключить свой OpenModel-ключ\n"
+        "👑 <b>Премиум</b> — 450 ⭐/мес\n  Gemini 2.5 Flash · топ-качество\n"
+        "  можно подключить свой Gemini-ключ\n"
         "━━━━━━━━━━━━━━━\n"
         "Оплата — звёздами Telegram ⭐",
         parse_mode="HTML", reply_markup=kb_plans(),
@@ -796,7 +811,7 @@ async def cb_status(cb: CallbackQuery):
 
     plan = get_user_plan(user)
     if is_admin(user_id):
-        status = "👑 <b>Администратор</b>\n♾️ Безлимит · DeepSeek V4 (OpenModel)"
+        status = "👑 <b>Администратор</b>\n♾️ Безлимит · Gemini 2.5 Flash"
     elif is_subscribed(user):
         until = datetime.fromisoformat(user["sub_until"]).strftime("%d.%m.%Y")
         status = f"{plan['name']}\nДо: <b>{until}</b>\nМодель: <code>{plan['model']}</code>"
@@ -826,22 +841,22 @@ async def cb_settings(cb: CallbackQuery):
     if not can_premium:
         await cb.message.edit_text(
             "⚙️ <b>Настройки</b>\n━━━━━━━━━━━━━━━\n"
-            "Выбор модели и подключение своего OpenModel-ключа доступны "
+            "Выбор модели и подключение своего Gemini-ключа доступны "
             "на тарифе 👑 <b>Премиум</b>.",
             parse_mode="HTML", reply_markup=kb_back(),
         )
         await cb.answer()
         return
 
-    cur_model = (user.get("ds_model") or PREMIUM_MODEL)
+    cur_model = (user.get("ds_model") or GEMINI_PREMIUM_MODEL)
     key_state = "свой ключ подключён 🔑" if user.get("ds_key") else "используются ключи бота"
     await cb.message.edit_text(
         "⚙️ <b>Настройки (Премиум)</b>\n━━━━━━━━━━━━━━━\n"
         f"Текущая модель: <code>{cur_model}</code>\n"
         f"Ключ: {key_state}\n━━━━━━━━━━━━━━━\n"
-        "• <b>Flash</b> — DeepSeek V4 Flash, бесплатно (10 запросов/мин)\n"
-        "• <b>Pro</b> — точнее, но тратит кредиты OpenModel\n\n"
-        "Можешь вставить свой OpenModel-ключ (om-…) — тогда запросы пойдут через него.",
+        "• <b>Flash</b> — Gemini 2.5 Flash, умнее\n"
+        "• <b>Flash-Lite</b> — быстрее и легче по лимитам\n\n"
+        "Можешь вставить свой Gemini-ключ (AIza…) — тогда запросы пойдут через него.",
         parse_mode="HTML", reply_markup=kb_settings(user, admin),
     )
     await cb.answer()
@@ -849,15 +864,15 @@ async def cb_settings(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "model_fast")
 async def cb_model_fast(cb: CallbackQuery):
-    set_user_field(cb.from_user.id, "ds_model", PREMIUM_MODEL)
-    await cb.answer("Модель: Flash (бесплатно) ✅")
+    set_user_field(cb.from_user.id, "ds_model", GEMINI_PREMIUM_MODEL)
+    await cb.answer("Модель: Flash (умнее) ✅")
     await cb_settings(cb)
 
 
 @dp.callback_query(F.data == "model_pro")
 async def cb_model_pro(cb: CallbackQuery):
-    set_user_field(cb.from_user.id, "ds_model", PREMIUM_MODEL_PRO)
-    await cb.answer("Модель: Pro (тратит кредиты) ✅")
+    set_user_field(cb.from_user.id, "ds_model", GEMINI_FAST_MODEL)
+    await cb.answer("Модель: Flash-Lite (быстрее) ✅")
     await cb_settings(cb)
 
 
@@ -878,8 +893,8 @@ async def cb_set_key(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(SettingsSG.waiting_key)
     await cb.message.answer(
-        "🔑 Пришли свой ключ OpenModel одним сообщением (начинается с <code>om-</code>).\n"
-        "Получить можно на console.openmodel.ai.\n\nЧтобы отменить — отправь /cancel",
+        "🔑 Пришли свой ключ Gemini одним сообщением (начинается с <code>AIza</code> или <code>AQ.</code>).\n"
+        "Получить бесплатно (без карты) на aistudio.google.com.\n\nЧтобы отменить — отправь /cancel",
         parse_mode="HTML",
     )
     await cb.answer()
@@ -912,8 +927,8 @@ async def receive_ds_key(msg: Message, state: FSMContext):
         await msg.delete()
     except TelegramBadRequest:
         pass
-    if not (key.startswith("om-") and len(key) >= 12):
-        await msg.answer("❌ Это не похоже на ключ OpenModel (должен начинаться с om-). "
+    if not ((key.startswith("AIza") or key.startswith("AQ.")) and len(key) >= 20):
+        await msg.answer("❌ Это не похоже на ключ Gemini (должен начинаться с AIza или AQ.). "
                          "Попробуй ещё раз через ⚙️ Настройки.")
         return
     set_user_field(msg.from_user.id, "ds_key", key)
@@ -949,7 +964,7 @@ async def cb_admin_panel(cb: CallbackQuery):
         await cb.answer("⛔ Нет доступа", show_alert=True)
         return
     stats = get_stats()
-    keys_note = f"{len(OPENMODEL_KEYS)} шт." if OPENMODEL_KEYS else "не заданы ⚠️"
+    keys_note = "задан ✅" if GEMINI_API_KEY else "не задан ⚠️"
     await cb.message.edit_text(
         f"👑 <b>Админ-панель</b>\n━━━━━━━━━━━━━━━\n"
         f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
@@ -957,7 +972,7 @@ async def cb_admin_panel(cb: CallbackQuery):
         f"⚡ Базовых: <b>{stats['by_plan']['basic']}</b>\n"
         f"🔥 Стандарт: <b>{stats['by_plan']['standard']}</b>\n"
         f"👑 Премиум: <b>{stats['by_plan']['premium']}</b>\n\n"
-        f"🔑 Ключей OpenModel: <b>{keys_note}</b>\n━━━━━━━━━━━━━━━\n"
+        f"🔑 Ключ Gemini: <b>{keys_note}</b>\n━━━━━━━━━━━━━━━\n"
         f"Выдать подписку:\n<code>/give USER_ID план дней</code>\n"
         f"Планы: basic, standard, premium\n"
         f"Пример: <code>/give 123456789 premium 30</code>",
@@ -1133,8 +1148,8 @@ async def handle_message(msg: Message):
 
 async def main():
     init_db()
-    if not OPENMODEL_KEYS:
-        log.warning("OPENMODEL_KEYS не заданы — Премиум будет отвечать на резервной модели Groq.")
+    if not GEMINI_API_KEY:
+        log.warning("GEMINI_API_KEY не задан — Премиум будет отвечать на резервной модели Groq.")
     bot = Bot(token=BOT_TOKEN)
     log.info("Бот запущен ✅")
     await dp.start_polling(bot)
