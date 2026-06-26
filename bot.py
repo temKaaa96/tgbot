@@ -137,6 +137,10 @@ def init_db():
     for col, decl in migrations.items():
         if col not in existing:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+    # одноразовая чистка «хвостов» старой OpenModel-версии
+    con.execute("UPDATE users SET ds_model=NULL WHERE ds_model IS NOT NULL AND ds_model NOT LIKE 'gemini%'")
+    con.execute("UPDATE users SET ds_key=NULL WHERE ds_key IS NOT NULL "
+                "AND ds_key NOT LIKE 'AIza%' AND ds_key NOT LIKE 'AQ.%'")
     con.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -511,8 +515,16 @@ def resolve_text_engine(user, plan: dict, admin: bool):
     """Возвращает (provider, model, keys) для текстового ответа."""
     wants_premium = admin or plan["provider"] == "gemini"
     if wants_premium:
-        model = (user.get("ds_model") if user else None) or GEMINI_PREMIUM_MODEL
-        key = (user.get("ds_key") if user else None) or GEMINI_API_KEY
+        # игнорируем «хвосты» от старой OpenModel-версии в базе
+        ds_model = user.get("ds_model") if user else None
+        if not (ds_model and ds_model.startswith("gemini")):
+            ds_model = None
+        ds_key = user.get("ds_key") if user else None
+        if not (ds_key and (ds_key.startswith("AIza") or ds_key.startswith("AQ."))):
+            ds_key = None
+
+        model = ds_model or GEMINI_PREMIUM_MODEL
+        key = ds_key or GEMINI_API_KEY
         if key:
             return "gemini", model, [key]
         return "groq", GROQ_FALLBACK_MODEL, [None]   # резерв Groq, если нет ключа Gemini
